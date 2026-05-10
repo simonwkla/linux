@@ -284,6 +284,7 @@ enum mlx5_ib_create_cq_flags {
 	MLX5_IB_CREATE_CQ_FLAGS_CQE_128B_PAD	= 1 << 0,
 	MLX5_IB_CREATE_CQ_FLAGS_UAR_PAGE_INDEX  = 1 << 1,
 	MLX5_IB_CREATE_CQ_FLAGS_REAL_TIME_TS	= 1 << 2,
+	MLX5_IB_CREATE_CQ_FLAGS_COH_BUF		= 1 << 3,
 };
 
 struct mlx5_ib_create_cq {
@@ -299,8 +300,10 @@ struct mlx5_ib_create_cq {
 };
 
 struct mlx5_ib_create_cq_resp {
-	__u32	cqn;
-	__u32	reserved;
+	__u32		cqn;
+	__u32		reserved;
+	__aligned_u64	cq_buf_offset;
+	__aligned_u64	cq_buf_size;
 };
 
 struct mlx5_ib_resize_cq {
