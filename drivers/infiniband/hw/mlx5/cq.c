@@ -725,6 +725,7 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
 	unsigned int page_offset_quantized;
 	size_t ucmdlen;
 	__be64 *pas;
+	cq->coh_dbrec_mentry = NULL;
 	int ncont;
 	void *cqc;
 	int err;
@@ -740,41 +741,73 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
 
 	if ((ucmd.flags & ~(MLX5_IB_CREATE_CQ_FLAGS_CQE_128B_PAD |
 			    MLX5_IB_CREATE_CQ_FLAGS_UAR_PAGE_INDEX |
-			    MLX5_IB_CREATE_CQ_FLAGS_REAL_TIME_TS)))
+			    MLX5_IB_CREATE_CQ_FLAGS_COH_BUF |
+			    MLX5_IB_CREATE_CQ_FLAGS_REAL_TIME_TS))) 
 		return -EINVAL;
 
 	if ((ucmd.cqe_size != 64 && ucmd.cqe_size != 128) ||
-	    ucmd.reserved0 || ucmd.reserved1)
+	    ucmd.reserved0 || ucmd.reserved1) 
 		return -EINVAL;
 
 	*cqe_size = ucmd.cqe_size;
 
-	cq->buf.umem =
-		ib_umem_get(&dev->ib_dev, ucmd.buf_addr,
-			    entries * ucmd.cqe_size, IB_ACCESS_LOCAL_WRITE);
-	if (IS_ERR(cq->buf.umem)) {
-		err = PTR_ERR(cq->buf.umem);
-		return err;
+	bool coh = !!(ucmd.flags & MLX5_IB_CREATE_CQ_FLAGS_COH_BUF);
+
+	if(coh){
+		// use coherent mem allocation (same size entries * ucmd.cqe_size)
+		cq->buf.coh_mentry = mlx5_ib_alloc_coh_buf(dev, context, entries * ucmd.cqe_size);
+		if(IS_ERR(cq->buf.coh_mentry)){
+			err = PTR_ERR(cq->buf.coh_mentry);
+			cq->buf.coh_mentry = NULL;
+			return err;
+		}
+
+		cq->buf.cqe_size = ucmd.cqe_size;
+		cq->buf.nent = entries;
+
+		cq->coh_dbrec_mentry = mlx5_ib_alloc_coh_buf(dev, context, PAGE_SIZE);
+		if (IS_ERR(cq->coh_dbrec_mentry)) {
+			err = PTR_ERR(cq->coh_dbrec_mentry);
+			cq->coh_dbrec_mentry = NULL;
+			goto err_coh;
+		}
+		cq->db.dma = cq->coh_dbrec_mentry->coh_dma;
+
+		page_size = PAGE_SIZE;
+		page_offset_quantized = 0;
+		// number of continguous pages is easy (since dma coherent buffer is continugous by definition)
+		// -> divide by page size
+		ncont = cq->buf.coh_mentry->coh_size >> PAGE_SHIFT;
+	} else {
+		cq->buf.umem = ib_umem_get(&dev->ib_dev, ucmd.buf_addr,entries * ucmd.cqe_size, IB_ACCESS_LOCAL_WRITE);
+		if (IS_ERR(cq->buf.umem)) {
+			err = PTR_ERR(cq->buf.umem);
+			cq->buf.coh_mentry = NULL;
+			mlx5_ib_warn(dev,"create_cq_user: mlx5_ib_alloc_coh_buf failed err=%d entries=%d cqe_sz=%u\n",err, entries, ucmd.cqe_size);
+			return err;
+		}
+
+		page_size = mlx5_umem_find_best_cq_quantized_pgoff(
+			cq->buf.umem, cqc, log_page_size, MLX5_ADAPTER_PAGE_SHIFT,
+			page_offset, 64, &page_offset_quantized);
+		if (!page_size) {
+			err = -EINVAL;
+			goto err_umem;
+		}
+
+		err = mlx5_ib_db_map_user(context, ucmd.db_addr, &cq->db);
+		if (err) {
+			mlx5_ib_warn(dev,"create_cq_user: mlx5_ib_db_map_user failed err=%d (coh)\n",err);
+			goto err_umem;
+		}
+
+		ncont = ib_umem_num_dma_blocks(cq->buf.umem, page_size);
+		mlx5_ib_dbg(
+			dev,
+			"addr 0x%llx, size %u, npages %zu, page_size %lu, ncont %d\n",
+			ucmd.buf_addr, entries * ucmd.cqe_size,
+			ib_umem_num_pages(cq->buf.umem), page_size, ncont);
 	}
-
-	page_size = mlx5_umem_find_best_cq_quantized_pgoff(
-		cq->buf.umem, cqc, log_page_size, MLX5_ADAPTER_PAGE_SHIFT,
-		page_offset, 64, &page_offset_quantized);
-	if (!page_size) {
-		err = -EINVAL;
-		goto err_umem;
-	}
-
-	err = mlx5_ib_db_map_user(context, ucmd.db_addr, &cq->db);
-	if (err)
-		goto err_umem;
-
-	ncont = ib_umem_num_dma_blocks(cq->buf.umem, page_size);
-	mlx5_ib_dbg(
-		dev,
-		"addr 0x%llx, size %u, npages %zu, page_size %lu, ncont %d\n",
-		ucmd.buf_addr, entries * ucmd.cqe_size,
-		ib_umem_num_pages(cq->buf.umem), page_size, ncont);
 
 	*inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
 		 MLX5_FLD_SZ_BYTES(create_cq_in, pas[0]) * ncont;
@@ -785,11 +818,15 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
 	}
 
 	pas = (__be64 *)MLX5_ADDR_OF(create_cq_in, *cqb, pas);
-	mlx5_ib_populate_pas(cq->buf.umem, page_size, pas, 0);
-
 	cqc = MLX5_ADDR_OF(create_cq_in, *cqb, cq_context);
-	MLX5_SET(cqc, cqc, log_page_size,
-		 order_base_2(page_size) - MLX5_ADAPTER_PAGE_SHIFT);
+
+	if (coh) {
+		mlx5_ib_populate_pas_coh(cq->buf.coh_mentry, page_size, pas, 0);
+	} else {
+		mlx5_ib_populate_pas(cq->buf.umem, page_size, pas, 0);
+	}
+
+	MLX5_SET(cqc, cqc, log_page_size,order_base_2(page_size) - MLX5_ADAPTER_PAGE_SHIFT);
 	MLX5_SET(cqc, cqc, page_offset, page_offset_quantized);
 
 	if (uverbs_attr_is_valid(attrs, MLX5_IB_ATTR_CREATE_CQ_UAR_INDEX)) {
@@ -855,10 +892,23 @@ err_cqb:
 	kvfree(*cqb);
 
 err_db:
-	mlx5_ib_db_unmap_user(context, &cq->db);
+	if (cq->coh_dbrec_mentry) {
+		mlx5_ib_release_coh_buf(cq->coh_dbrec_mentry);
+		cq->coh_dbrec_mentry = NULL;
+	} else {
+		mlx5_ib_db_unmap_user(context, &cq->db);
+	}
 
+err_coh:
+	if (cq->buf.coh_mentry){
+		mlx5_ib_release_coh_buf(cq->buf.coh_mentry);
+		cq->buf.coh_mentry = NULL;
+	}
 err_umem:
-	ib_umem_release(cq->buf.umem);
+	if(cq->buf.umem){
+		ib_umem_release(cq->buf.umem);
+		cq->buf.umem = NULL;
+	}
 	return err;
 }
 
@@ -867,8 +917,19 @@ static void destroy_cq_user(struct mlx5_ib_cq *cq, struct ib_udata *udata)
 	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
 		udata, struct mlx5_ib_ucontext, ibucontext);
 
-	mlx5_ib_db_unmap_user(context, &cq->db);
-	ib_umem_release(cq->buf.umem);
+	if (cq->coh_dbrec_mentry) {
+		mlx5_ib_release_coh_buf(cq->coh_dbrec_mentry);
+		cq->coh_dbrec_mentry = NULL;
+	} else {
+		mlx5_ib_db_unmap_user(context, &cq->db);
+	}
+	if(cq->buf.coh_mentry){
+		mlx5_ib_release_coh_buf(cq->buf.coh_mentry);
+		cq->buf.coh_mentry = NULL;
+	} else {
+		ib_umem_release(cq->buf.umem);
+		cq->buf.umem = NULL;
+	}
 }
 
 static void init_cq_frag_buf(struct mlx5_ib_cq_buf *buf)
@@ -1036,11 +1097,27 @@ int mlx5_ib_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 
 	INIT_LIST_HEAD(&cq->wc_list);
 
-	if (udata)
-		if (ib_copy_to_udata(udata, &cq->mcq.cqn, sizeof(__u32))) {
+	if (udata) {
+		struct mlx5_ib_create_cq_resp resp = {
+			.cqn = cq->mcq.cqn,
+		};
+		size_t resp_len;
+
+		if(cq->buf.coh_mentry){
+			resp.cq_buf_offset = mlx5_entry_to_mmap_offset(cq->buf.coh_mentry);
+			resp.cq_buf_size = cq->buf.coh_mentry->coh_size;
+		}
+		if(cq->coh_dbrec_mentry){
+			resp.dbrec_offset = mlx5_entry_to_mmap_offset(cq->coh_dbrec_mentry);
+			resp.dbrec_size = PAGE_SIZE;
+		}
+
+		resp_len = min_t(size_t, udata->outlen, sizeof(resp));
+		if (ib_copy_to_udata(udata, &resp, resp_len)) {
 			err = -EFAULT;
 			goto err_cmd;
 		}
+	}
 
 
 	kvfree(cqb);

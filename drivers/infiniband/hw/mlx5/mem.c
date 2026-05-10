@@ -30,6 +30,8 @@
  * SOFTWARE.
  */
 
+#include "linux/types.h"
+#include "vdso/page.h"
 #include <rdma/ib_umem_odp.h>
 #include "mlx5_ib.h"
 
@@ -46,6 +48,19 @@ void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
 		*pas = cpu_to_be64(rdma_block_iter_dma_address(&biter) |
 				   access_flags);
 		pas++;
+	}
+}
+
+
+void mlx5_ib_populate_pas_coh(struct  mlx5_user_mmap_entry *mentry, size_t page_size, __be64 *pas, u64 access_flags){
+	dma_addr_t dma_addr = mentry->coh_dma;
+
+	size_t ncont = mentry->coh_size / page_size;
+
+	for (int i = 0; i < ncont; i++){
+		*pas = cpu_to_be64(dma_addr | access_flags);
+		pas++;
+		dma_addr += page_size;
 	}
 }
 

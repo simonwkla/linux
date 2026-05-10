@@ -162,6 +162,7 @@ enum mlx5_ib_mmap_type {
 	MLX5_IB_MMAP_TYPE_UAR_WC = 3,
 	MLX5_IB_MMAP_TYPE_UAR_NC = 4,
 	MLX5_IB_MMAP_TYPE_MEMIC_OP = 5,
+	MLX5_IB_MMAP_TYPE_COH_BUF = 6
 };
 
 struct mlx5_bfreg_info {
@@ -508,6 +509,8 @@ struct mlx5_ib_qp {
 	struct mlx5_frag_buf	buf;
 
 	struct mlx5_db		db;
+	struct mlx5_user_mmap_entry *coh_dbrec_mentry;
+	struct mlx5_user_mmap_entry *coh_buf_mentry;
 	struct mlx5_ib_wq	rq;
 
 	u8			sq_signal_bits;
@@ -554,6 +557,8 @@ struct mlx5_ib_cq_buf {
 	struct mlx5_frag_buf_ctrl fbc;
 	struct mlx5_frag_buf    frag_buf;
 	struct ib_umem		*umem;
+	// replaces umem in coherent mode
+	struct mlx5_user_mmap_entry *coh_mentry;
 	int			cqe_size;
 	int			nent;
 };
@@ -568,6 +573,7 @@ struct mlx5_ib_cq {
 	struct mlx5_core_cq	mcq;
 	struct mlx5_ib_cq_buf	buf;
 	struct mlx5_db		db;
+	struct mlx5_user_mmap_entry *coh_dbrec_mentry;
 
 	/* serialize access to the CQ
 	 */
@@ -628,7 +634,19 @@ struct mlx5_user_mmap_entry {
 	u8 mmap_flag;
 	u64 address;
 	u32 page_idx;
+	// virtual addr of coherent buffer
+	void *coh_vaddr;
+	// dma addr of coherent buffer
+	dma_addr_t coh_dma;
+	// size of the buffer
+	size_t coh_size;
 };
+
+struct mlx5_user_mmap_entry * mlx5_ib_alloc_coh_buf(struct mlx5_ib_dev *dev,struct mlx5_ib_ucontext *ctx, size_t size);
+void mlx5_ib_release_coh_buf(struct mlx5_user_mmap_entry *m);
+
+u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry);
+int mlx5_rdma_user_mmap_entry_insert(struct mlx5_ib_ucontext *c,struct mlx5_user_mmap_entry *entry,size_t length);
 
 enum mlx5_mkey_type {
 	MLX5_MKEY_MR = 1,
@@ -1437,6 +1455,7 @@ int mlx5_ib_query_port(struct ib_device *ibdev, u32 port,
 		       struct ib_port_attr *props);
 void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
 			  u64 access_flags);
+void mlx5_ib_populate_pas_coh(struct  mlx5_user_mmap_entry *mentry, size_t page_size, __be64 *pas, u64 access_flags);
 int mlx5_ib_get_cqe_size(struct ib_cq *ibcq);
 int mlx5_mkey_cache_init(struct mlx5_ib_dev *dev);
 void mlx5_mkey_cache_cleanup(struct mlx5_ib_dev *dev);

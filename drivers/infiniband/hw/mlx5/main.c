@@ -2343,6 +2343,11 @@ static void mlx5_ib_mmap_free(struct rdma_user_mmap_entry *entry)
 				     context->devx_uid);
 		kfree(mentry);
 		break;
+	case MLX5_IB_MMAP_TYPE_COH_BUF:
+		pr_info("mlx5_coh_buf mmap free");
+		dma_free_coherent(&dev->mdev->pdev->dev, mentry->coh_size, mentry->coh_vaddr, mentry->coh_dma);
+		kfree(mentry);
+		break;
 	default:
 		WARN_ON(true);
 	}
@@ -2484,6 +2489,27 @@ static int mlx5_ib_mmap_offset(struct mlx5_ib_dev *dev,
 		return -EINVAL;
 
 	mentry = to_mmmap(entry);
+
+	if(mentry->mmap_flag == MLX5_IB_MMAP_TYPE_COH_BUF) {
+		// mlx5 seems to 'misuse' pgoff for something else 
+		// -> will be non zero -> mmap fill fail for non zero
+		unsigned long saved_pgoff = vma->vm_pgoff;
+		vma->vm_pgoff = 0;
+
+		ret = dma_mmap_coherent(
+			&dev->mdev->pdev->dev,
+			vma,
+			mentry->coh_vaddr,
+			mentry->coh_dma,
+			mentry->coh_size
+		);
+
+		vma->vm_pgoff = saved_pgoff;
+
+		rdma_user_mmap_entry_put(&mentry->rdma_entry);
+		return ret;
+	}
+
 	pfn = (mentry->address >> PAGE_SHIFT);
 	if (mentry->mmap_flag == MLX5_IB_MMAP_TYPE_VAR ||
 	    mentry->mmap_flag == MLX5_IB_MMAP_TYPE_UAR_NC)
@@ -2498,7 +2524,7 @@ static int mlx5_ib_mmap_offset(struct mlx5_ib_dev *dev,
 	return ret;
 }
 
-static u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
+u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
 {
 	u64 cmd = (entry->rdma_entry.start_pgoff >> 16) & 0xFFFF;
 	u64 index = entry->rdma_entry.start_pgoff & 0xFFFF;
@@ -3871,7 +3897,7 @@ static int mmap_obj_cleanup(struct ib_uobject *uobject,
 	return 0;
 }
 
-static int mlx5_rdma_user_mmap_entry_insert(struct mlx5_ib_ucontext *c,
+int mlx5_rdma_user_mmap_entry_insert(struct mlx5_ib_ucontext *c,
 					    struct mlx5_user_mmap_entry *entry,
 					    size_t length)
 {
@@ -5116,6 +5142,8 @@ static struct auxiliary_driver mlx5r_driver = {
 static int __init mlx5_ib_init(void)
 {
 	int ret;
+
+	pr_info("mlx5: coherent mem mlx5 patch (init)");
 
 	xlt_emergency_page = (void *)__get_free_page(GFP_KERNEL);
 	if (!xlt_emergency_page)

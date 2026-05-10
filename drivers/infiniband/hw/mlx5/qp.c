@@ -998,7 +998,21 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 	if (err)
 		goto err_bfreg;
 
-	if (ucmd->buf_addr && ubuffer->buf_size) {
+	qp->coh_buf_mentry = NULL;
+	if (qp->flags_en & MLX5_QP_FLAG_COH_BUF) {
+		qp->coh_buf_mentry = mlx5_ib_alloc_coh_buf(dev,context,ubuffer->buf_size);
+		if (IS_ERR(qp->coh_buf_mentry)) {
+			err = PTR_ERR(qp->coh_buf_mentry);
+			qp->coh_buf_mentry = NULL;
+			mlx5_ib_warn(dev, "create_user_qp: coh qp buf alloc failed err=%d buf_size=%u\n",err, ubuffer->buf_size);
+			goto err_bfreg;
+		}
+		ubuffer->umem = NULL;
+		ubuffer->buf_addr = 0;
+		page_size = PAGE_SIZE;
+		page_offset_quantized = 0;
+		ncont = qp->coh_buf_mentry->coh_size >> PAGE_SHIFT;
+	} else if (ucmd->buf_addr && ubuffer->buf_size) {
 		ubuffer->buf_addr = ucmd->buf_addr;
 		ubuffer->umem = ib_umem_get(&dev->ib_dev, ubuffer->buf_addr,
 					    ubuffer->buf_size, 0);
@@ -1031,12 +1045,15 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 	MLX5_SET(create_qp_in, *in, uid, uid);
 	qpc = MLX5_ADDR_OF(create_qp_in, *in, qpc);
 	pas = (__be64 *)MLX5_ADDR_OF(create_qp_in, *in, pas);
-	if (ubuffer->umem) {
+	if (qp->coh_buf_mentry) {
+		mlx5_ib_populate_pas_coh(qp->coh_buf_mentry, page_size, pas, 0);
+		resp->buf_offset = mlx5_entry_to_mmap_offset(qp->coh_buf_mentry);
+		resp->buf_size = qp->coh_buf_mentry->coh_size;
+	} else if (ubuffer->umem) {
 		mlx5_ib_populate_pas(ubuffer->umem, page_size, pas, 0);
-		MLX5_SET(qpc, qpc, log_page_size,
-			 order_base_2(page_size) - MLX5_ADAPTER_PAGE_SHIFT);
-		MLX5_SET(qpc, qpc, page_offset, page_offset_quantized);
 	}
+	MLX5_SET(qpc, qpc, log_page_size, order_base_2(page_size) - MLX5_ADAPTER_PAGE_SHIFT);
+	MLX5_SET(qpc, qpc, page_offset, page_offset_quantized);
 	MLX5_SET(qpc, qpc, uar_page, uar_index);
 	if (bfregn != MLX5_IB_INVALID_BFREG)
 		resp->bfreg_index = adjust_bfregn(dev, &context->bfregi, bfregn);
@@ -1044,10 +1061,24 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		resp->bfreg_index = MLX5_IB_INVALID_BFREG;
 	qp->bfregn = bfregn;
 
-	err = mlx5_ib_db_map_user(context, ucmd->db_addr, &qp->db);
-	if (err) {
-		mlx5_ib_dbg(dev, "map failed\n");
-		goto err_free;
+	qp->coh_dbrec_mentry = NULL;
+	if (qp->flags_en & MLX5_QP_FLAG_COH_DBREC) {
+		qp->coh_dbrec_mentry = mlx5_ib_alloc_coh_buf(dev, context, PAGE_SIZE);
+		if (IS_ERR(qp->coh_dbrec_mentry)) {
+			err = PTR_ERR(qp->coh_dbrec_mentry);
+			qp->coh_dbrec_mentry = NULL;
+			mlx5_ib_warn(dev, "create_user_qp: coh dbrec alloc failed err=%d\n", err);
+			goto err_free;
+		}
+		qp->db.dma = qp->coh_dbrec_mentry->coh_dma;
+		resp->dbrec_offset = mlx5_entry_to_mmap_offset(qp->coh_dbrec_mentry);
+		resp->dbrec_size = PAGE_SIZE;
+	} else {
+		err = mlx5_ib_db_map_user(context, ucmd->db_addr, &qp->db);
+		if (err) {
+			mlx5_ib_dbg(dev, "map failed\n");
+			goto err_free;
+		}
 	}
 
 	return 0;
@@ -1056,7 +1087,12 @@ err_free:
 	kvfree(*in);
 
 err_umem:
-	ib_umem_release(ubuffer->umem);
+	if (qp->coh_buf_mentry) {
+		mlx5_ib_release_coh_buf(qp->coh_buf_mentry);
+		qp->coh_buf_mentry = NULL;
+	} else {
+		ib_umem_release(ubuffer->umem);
+	}
 
 err_bfreg:
 	if (bfregn != MLX5_IB_INVALID_BFREG)
@@ -1072,8 +1108,18 @@ static void destroy_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 
 	if (udata) {
 		/* User QP */
-		mlx5_ib_db_unmap_user(context, &qp->db);
-		ib_umem_release(base->ubuffer.umem);
+		if (qp->coh_dbrec_mentry) {
+			mlx5_ib_release_coh_buf(qp->coh_dbrec_mentry);
+			qp->coh_dbrec_mentry = NULL;
+		} else {
+			mlx5_ib_db_unmap_user(context, &qp->db);
+		}
+		if (qp->coh_buf_mentry) {
+			mlx5_ib_release_coh_buf(qp->coh_buf_mentry);
+			qp->coh_buf_mentry = NULL;
+		} else {
+			ib_umem_release(base->ubuffer.umem);
+		}
 
 		/*
 		 * Free only the BFREGs which are handled by the kernel.
@@ -2956,6 +3002,8 @@ static int process_vendor_flags(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 
 	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_BFREG_INDEX, true, qp);
 	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_UAR_PAGE_INDEX, true, qp);
+	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_COH_DBREC, true, qp);
+	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_COH_BUF, true, qp);
 
 	cond = qp->flags_en & ~(MLX5_QP_FLAG_TUNNEL_OFFLOADS |
 				MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_UC |
